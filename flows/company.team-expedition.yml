@@ -1,0 +1,88 @@
+id: expedition
+namespace: company.team
+
+inputs:
+  - id: search_term
+    type: STRING
+    defaults: '"grant" OR "funding available" OR "apply now" OR "request for proposals" OR "application deadline" OR "funding amount" inurl:grant site:.org'
+
+tasks:
+  - id: search
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install kestra firecrawl supabase
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    containerImage: python:slim
+    warningOnStdErr: false
+    script: |
+      from firecrawl import FirecrawlApp
+      import json
+      import ssl
+      from urllib.parse import quote_plus
+      import urllib.request
+      from kestra import Kestra
+      from supabase import create_client, Client
+
+      logger = Kestra.logger()
+
+      url = "{{kv('supabase_url')}}"
+      key = "{{kv('supabase_key')}}"
+      search_query = '{{inputs.search_term}}'
+      
+      supabase: Client = create_client(url, key)
+
+      logger.info("Creating new expedition entry")
+      expedition_response = (supabase.table("expeditions").insert({
+        "search_term" : search_query, "status" : "started"
+      }).execute())
+
+      logger.info(f"Created new expedition record: {expedition_response}")
+      
+      logger.info("Initiating search query")
+      num=5
+      url = "http://www.google.com/search?cr=countryUS&lr=lang_en&hl=us&fr=en&num="+str(num)+"&aq_dqr=w&q="
+      ssl._create_default_https_context = ssl._create_unverified_context
+      opener = urllib.request.build_opener(
+          urllib.request.ProxyHandler(
+              {'http': '{{kv('brd_proxy_string')}}',
+              'https': '{{kv('brd_proxy_string')}}'}))
+      result = (opener.open(url+quote_plus(search_query)+"&inurl%3Agrant&brd_json=1").read())
+
+      json_response = json.loads(result.decode('utf-8'))
+
+      link_list = [item["link"] for item in json_response["organic"] if isinstance(item, dict) and "link" in item]
+
+      if link_list:
+        logger.info(f"Links found:{link_list}")
+
+        logger.info("Creating new search result entries")
+        for link in link_list:
+          try:
+            search_result = (supabase.table("search_results").insert({
+              "url": link, "expedition_id": expedition_response.data[0]["id"]
+            }).execute())
+            logger.info(f"Search result created for: {search_result}")
+          except:
+            logger.error("URL already exists: {link}")
+      else:
+        logger.error("No url found in expedition")
+
+      logger.info("Updating expedition as complete")
+      update_result = (supabase.table("expeditions").update({
+        "status":"complete"
+      }).eq("id", expedition_response.data[0]["id"]).execute())
+
+      Kestra.outputs({"link_list":link_list})
+
+  - id: extract_domains
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: company.team
+    flowId: domain_extraction
+    wait: true
+    inputs:
+      url_list: "{{ outputs.search.vars.link_list }}"
+outputs:
+  - id: link_list
+    type: ARRAY
+    value: "{{outputs.search.vars.link_list}}"

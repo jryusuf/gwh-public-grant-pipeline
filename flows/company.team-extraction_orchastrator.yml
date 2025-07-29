@@ -1,0 +1,54 @@
+id: extraction_orchastrator
+namespace: company.team
+
+tasks:
+  - id: hello
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install kestra supabase
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    warningOnStdErr: false
+    script: |
+      from kestra import Kestra
+      from supabase import create_client, Client
+
+      logger = Kestra.logger()
+
+      url = "{{kv('supabase_url')}}"
+      key = "{{kv('supabase_key')}}"
+      supabase: Client = create_client(url, key)
+
+      logger.info("Fetching scrape results...")
+      extraction_scrapes = (supabase.table("scrape_results").select("id", "status_code").order("created_at").eq("status_code", 200).is_("extraction_status", None).limit(10).execute())
+
+      logger.info(extraction_scrapes)
+      if len(extraction_scrapes.data) < 10:
+        logger.info(f"Not enough scrape results to start extraction")
+      else:
+        logger.info("Updating extraction_status")
+        for data in extraction_scrapes.data:
+          updated_scrape = (supabase.table("scrape_results").update({"extraction_status": "started"}).eq("id", data["id"]).execute())
+          logger.info(f"Updated extraction status for: {data}")
+
+        logger.info("Creating extraction job")
+        extraction_result = (supabase.table("extractions").insert({
+          "status":"started",
+          "result_1": extraction_scrapes.data[0]["id"],
+          "result_2": extraction_scrapes.data[1]["id"],
+          "result_3": extraction_scrapes.data[2]["id"],
+          "result_4": extraction_scrapes.data[3]["id"],
+          "result_5": extraction_scrapes.data[4]["id"],
+          "result_6": extraction_scrapes.data[5]["id"],
+          "result_7": extraction_scrapes.data[6]["id"],
+          "result_8": extraction_scrapes.data[7]["id"],
+          "result_9": extraction_scrapes.data[8]["id"],
+          "result_10": extraction_scrapes.data[9]["id"],
+        }).execute())
+        logger.info(f"Extraction created: {extraction_result}")
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    withSeconds: true
+    cron: "*/15 * * * * *"

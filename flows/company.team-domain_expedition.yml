@@ -1,0 +1,45 @@
+id: domain_expedition
+namespace: company.team
+
+tasks:
+  - id: get_non_expedited_domain
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install supabase
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    containerImage: python:slim
+    script: |
+      import os
+      from kestra import Kestra
+      from supabase import create_client, Client
+      import datetime
+
+      url = "{{kv('supabase_url')}}"
+      key = "{{kv('supabase_key')}}"
+
+      logger = Kestra.logger()
+      supabase: Client = create_client(url, key)
+
+      timestamp_threshold = datetime.datetime.now() - datetime.timedelta(days=7)
+
+      domain = (supabase.table("domains").select("*").lt("last_probe_ts", timestamp_threshold).order("created_at", desc = False).limit(1).execute())
+      logger.info(f"Got 1 domain for expedition: {domain}")
+      logger.info("Updating last_probe_ts...")
+      updated_domain = (supabase.table("domains").update({"last_probe_ts": datetime.datetime.now().isoformat()}).eq("id", domain.data[0]["id"]).execute())
+      logger.info(f"Updated domain: {updated_domain}")
+      Kestra.outputs({"domain": updated_domain.data[0]["domain"]})
+  
+  - id: probe_expedition_subflow
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: company.team
+    flowId: probe_expedition
+    wait: true
+    inputs:
+      domain: "{{outputs.get_non_expedited_domain.vars.domain}}"
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    withSeconds: true
+    cron: "*/15 * * * * *"
