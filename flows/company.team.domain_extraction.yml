@@ -1,0 +1,45 @@
+id: domain_extraction
+namespace: company.team
+
+inputs:
+  - id: url_list
+    type: ARRAY
+    itemType: STRING
+    defaults: ["https://image.google.com/?parameters", "https://www.example.co.uk/path", "https://sub.domain.another-example.com"]
+    displayName: "URL List"
+
+tasks:
+  - id: domain_extract
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install tldextract kestra supabase
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    containerImage: python:slim
+    warningOnStdErr: false
+    script: |
+      import tldextract
+      from supabase import create_client, Client
+      from kestra import Kestra
+
+      logger = Kestra.logger()
+
+      urls = {{inputs.url_list}}
+      url = "{{kv('supabase_url')}}"
+      key = "{{kv('supabase_key')}}"
+      
+      supabase: Client = create_client(url, key)
+      
+      logger.info("Extracting unique top domains from list")
+      unique_domains = {tldextract.extract(url).top_domain_under_public_suffix for url in urls}
+      logger.info(f"{unique_domains}")
+
+      logger.info("Inserting domains")
+      for domain in unique_domains:
+        try:
+          domain_result = (supabase.table("domains").insert({
+            "domain" : domain
+          }).execute())
+
+        except Exception as e:
+          logger.error(f"{domain} already exists. {e}")

@@ -1,0 +1,170 @@
+id: grant_cluster_processor
+namespace: company.team
+
+inputs:
+  - id: grant_id_list
+    type: JSON
+    required: true
+    defaults: []
+    description: A list of newly vectorized raw_grant IDs to process for clustering.
+
+tasks:
+  - id: process_grant_clusters
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install kestra supabase numpy scikit-learn
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    containerImage: python:3.11-slim
+    warningOnStdErr: false
+    script: |
+      import json
+      import numpy as np
+      import ast  # <-- MODIFICATION 1: Import the AST module
+      from kestra import Kestra
+      from supabase import create_client, Client
+      from sklearn.metrics.pairwise import cosine_similarity
+
+      logger = Kestra.logger()
+      
+      # --- MODIFICATION 2: Add a safe parsing function ---
+      def parse_embedding(embedding_data):
+          """Safely parses embedding data, whether it's a string or already a list."""
+          if embedding_data is None:
+              return None
+          if isinstance(embedding_data, str):
+              try:
+                  return ast.literal_eval(embedding_data)
+              except (ValueError, SyntaxError):
+                  logger.warning(f"Could not parse embedding string: {embedding_data[:100]}...")
+                  return None
+          # If it's already a list, return it directly
+          return embedding_data
+
+      # --- CONFIGURATION & INITIALIZATION ---
+      DISTANCE_THRESHOLD = 0.25
+
+      url = "{{kv('supabase_url')}}"
+      key = "{{kv('supabase_key')}}"
+      supabase: Client = create_client(url, key)
+      logger.info("✅ Supabase client loaded.")
+
+      grant_ids = {{ inputs.grant_id_list }}
+
+      if not isinstance(grant_ids, list) or not grant_ids:
+          logger.info("No grant IDs provided. Exiting.")
+          Kestra.outputs({"status": "SKIPPED"})
+          exit()
+
+      # --- LOAD EXISTING CLUSTERS ---
+      logger.info("Fetching existing cluster centroids from the database...")
+      clusters_resp = supabase.table('grant_clusters').select('id, vector').execute()
+      existing_clusters = clusters_resp.data
+      logger.info(f"✅ Loaded {len(existing_clusters)} existing clusters.")
+
+      created_clusters = []
+      updated_clusters = []
+      failed_ids = []
+
+      # --- PROCESS EACH NEW GRANT ---
+      for grant_id in grant_ids:
+          try:
+              logger.info(f"--- Processing Grant ID: {grant_id} ---")
+              
+              grant_resp = supabase.table('raw_grants').select('*').eq('id', grant_id).single().execute()
+              
+              # --- MODIFICATION 3: Use the parser function ---
+              new_grant_vector_list = parse_embedding(grant_resp.data.get('vector'))
+
+              if not grant_resp.data or new_grant_vector_list is None:
+                  logger.warning(f"⚠️ Grant {grant_id} not found or has no valid vector. Skipping.")
+                  failed_ids.append({"id": grant_id, "reason": "Not found or invalid vector"})
+                  continue
+              
+              new_grant = grant_resp.data
+              new_grant_vector = np.array(new_grant_vector_list)
+
+              best_match_cluster_id = None
+              lowest_distance = float('inf')
+
+              if existing_clusters:
+                  for cluster in existing_clusters:
+                      cluster_vector_list = parse_embedding(cluster.get('vector'))
+                      if not cluster_vector_list: continue
+                      
+                      cluster_vector = np.array(cluster_vector_list)
+                      distance = 1 - cosine_similarity(new_grant_vector.reshape(1, -1), cluster_vector.reshape(1, -1))[0][0]
+                      if distance < lowest_distance:
+                          lowest_distance = distance
+                          best_match_cluster_id = cluster['id']
+              
+              if best_match_cluster_id and lowest_distance <= DISTANCE_THRESHOLD:
+                  logger.info(f"✅ Match found for grant {grant_id}. Assigning to cluster {best_match_cluster_id} (Distance: {lowest_distance:.4f}).")
+                  supabase.table('raw_grants').update({'cluster_id': best_match_cluster_id}).eq('id', grant_id).execute()
+                  
+                  logger.info(f"Recalculating centroid for cluster {best_match_cluster_id}...")
+                  all_members_resp = supabase.table('raw_grants').select('vector, grant_name, grant_organisation, grant_description, grant_amount, grant_date, grant_url, grant_eligibility').eq('cluster_id', best_match_cluster_id).execute()
+                  
+                  # Use the parser again when recalculating
+                  member_vectors_list = [parse_embedding(member['vector']) for member in all_members_resp.data]
+                  # Filter out any that failed to parse
+                  valid_member_vectors = [v for v in member_vectors_list if v is not None]
+                  
+                  if not valid_member_vectors:
+                      logger.warning(f"No valid vectors found for members of cluster {best_match_cluster_id}. Cannot update centroid.")
+                      continue
+
+                  new_centroid = np.mean(np.array(valid_member_vectors), axis=0)
+                  
+                  most_central_member = None
+                  min_dist_to_centroid = float('inf')
+                  for member in all_members_resp.data:
+                      member_vector_list = parse_embedding(member.get('vector'))
+                      if member_vector_list:
+                          dist = 1 - cosine_similarity(np.array(member_vector_list).reshape(1, -1), new_centroid.reshape(1, -1))[0][0]
+                          if dist < min_dist_to_centroid:
+                              min_dist_to_centroid = dist
+                              most_central_member = member
+
+                  if most_central_member:
+                      supabase.table('grant_clusters').update({
+                          'vector': new_centroid.tolist(),
+                          'grant_name': most_central_member['grant_name'],
+                          'grant_organisation': most_central_member['grant_organisation'],
+                          'grant_description': most_central_member['grant_description'],
+                          'grant_amount': most_central_member['grant_amount'],
+                          'grant_date': most_central_member['grant_date'],
+                          'grant_url': most_central_member['grant_url'],
+                          'grant_eligibility': most_central_member['grant_eligibility'],
+                          'status': 'updated'
+                      }).eq('id', best_match_cluster_id).execute()
+                      logger.info(f"✅ Cluster {best_match_cluster_id} updated.")
+                      updated_clusters.append(best_match_cluster_id)
+              else:
+                  logger.info(f"ℹ️ No close match found for grant {grant_id}. Creating a new cluster.")
+                  new_cluster_data = {
+                      'vector': new_grant_vector.tolist(), 'status': 'created',
+                      'grant_name': new_grant['grant_name'], 'grant_organisation': new_grant['grant_organisation'],
+                      'grant_description': new_grant['grant_description'], 'grant_amount': new_grant['grant_amount'],
+                      'grant_date': new_grant['grant_date'], 'grant_url': new_grant['grant_url'],
+                      'grant_eligibility': new_grant['grant_eligibility']
+                  }
+                  new_cluster_resp = supabase.table('grant_clusters').insert(new_cluster_data).execute()
+                  new_cluster_id = new_cluster_resp.data[0]['id']
+                  
+                  supabase.table('raw_grants').update({'cluster_id': new_cluster_id}).eq('id', grant_id).execute()
+                  
+                  existing_clusters.append({'id': new_cluster_id, 'vector': new_grant_vector.tolist()})
+                  logger.info(f"✅ New cluster {new_cluster_id} created.")
+                  created_clusters.append(new_cluster_id)
+
+          except Exception as e:
+              logger.error(f"❌ An unexpected error occurred for grant {grant_id}: {e}")
+              failed_ids.append({"id": grant_id, "reason": str(e)})
+      
+      logger.info(f"🎉 Clustering complete. Created: {len(created_clusters)}, Updated: {len(updated_clusters)}, Failed: {len(failed_ids)}.")
+      Kestra.outputs({
+          "created_cluster_ids": list(set(created_clusters)),
+          "updated_cluster_ids": list(set(updated_clusters)),
+          "failed_grant_ids": failed_ids
+      })

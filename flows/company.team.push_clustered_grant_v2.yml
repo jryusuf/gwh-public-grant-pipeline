@@ -1,0 +1,113 @@
+id: push_clustered_grant_v2
+namespace: company.team
+description: >
+  Finds a grant cluster to process (either by ID or automatically),
+  pushes it to an endpoint, and updates its final status with the returned ID.
+
+inputs:
+  - id: cluster_id
+    type: STRING
+    required: false
+    description: "Optional. The specific UUID of the grant_cluster to push. If omitted, the script will find one automatically."
+
+tasks:
+  - id: find_lock_and_prepare
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Finds a candidate, locks it, and prepares the payload."
+    # ... (this task's configuration and script remain unchanged) ...
+    beforeCommands:
+      - pip install kestra supabase
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    containerImage: python:3.11-slim
+    script: |
+      import json
+      from kestra import Kestra
+      from supabase import create_client, Client
+      logger = Kestra.logger()
+      supabase_url = "{{kv('supabase_url')}}"
+      supabase_key = "{{kv('supabase_key')}}"
+      supabase: Client = create_client(supabase_url, supabase_key)
+      cluster_id_input = "{{ inputs.cluster_id }}"
+      cluster_id_to_process = None
+      if cluster_id_input:
+          logger.info(f"Targeted mode: processing provided cluster ID: {cluster_id_input}")
+          cluster_id_to_process = cluster_id_input
+      else:
+          logger.info("Automatic mode: searching for a candidate cluster...")
+          candidate_resp = supabase.table("grant_clusters").select("id").in_("status", ["created", "updated"]).limit(1).execute()
+          if not candidate_resp.data:
+              logger.info("No clusters with status 'created' or 'updated' found. Exiting.")
+              Kestra.outputs({"status": "NO_CANDIDATE"})
+              exit()
+          cluster_id_to_process = candidate_resp.data[0]['id']
+          logger.info(f"Found candidate: {cluster_id_to_process}. Attempting to lock.")
+          update_resp = supabase.table("grant_clusters").update({"status": "inserting"}).eq("id", cluster_id_to_process).execute()
+          if not update_resp.data:
+              logger.error(f"Failed to lock cluster {cluster_id_to_process}. Another process may have grabbed it. Exiting.")
+              raise Exception("Failed to acquire lock")
+          logger.info(f"Successfully locked cluster {cluster_id_to_process}.")
+      cluster_resp = supabase.table("grant_clusters").select("*").eq("id", cluster_id_to_process).single().execute()
+      if not cluster_resp.data:
+          raise Exception(f"Failed to fetch data for cluster ID {cluster_id_to_process} after acquiring.")
+      cluster_data = cluster_resp.data
+      payload_dict = {
+          "url": cluster_data.get("grant_url"),
+          "grant_title": cluster_data.get("grant_name"),
+          "description": cluster_data.get("grant_description"),
+          "amount": cluster_data.get("grant_amount"),
+          "due_date": cluster_data.get("grant_date"),
+          "eligibility": cluster_data.get("grant_eligibility")
+      }
+      final_payload = [json.dumps(payload_dict)]
+      Kestra.outputs({
+          "grant_payload": final_payload,
+          "processed_cluster_id": cluster_id_to_process,
+          "status": "PROCESSED"
+      })
+      logger.info(f"Successfully prepared payload for cluster {cluster_id_to_process}.")
+
+  - id: call_grant_endpoint
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: company.team
+    flowId: mock_grant_receiver_with_output 
+    wait: true
+    inputs:
+      grant_data_list: "{{ outputs.find_lock_and_prepare.vars.grant_payload }}"
+
+  - id: update_final_status
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Updates the cluster's status to 'inserted' and stores the returned ID in the 'insert_id' column."
+    beforeCommands:
+      - pip install kestra supabase
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    containerImage: python:3.11-slim
+    script: |
+      from kestra import Kestra
+      from supabase import create_client, Client
+
+      logger = Kestra.logger()
+      supabase_url = "{{kv('supabase_url')}}"
+      supabase_key = "{{kv('supabase_key')}}"
+      supabase: Client = create_client(supabase_url, supabase_key)
+
+      cluster_id = "{{ outputs.find_lock_and_prepare.vars.processed_cluster_id }}"
+      
+      # --- THIS IS THE OTHER KEY CHANGE, USING THE NEW, CLEAN VARIABLE ---
+      # We now reference the 'returned_log_id' we created in the Subflow task's outputs.
+      pushed_log_id = "{{ outputs.call_grant_endpoint.outputs.pushed_log_id | default('') }}"
+
+      if not pushed_log_id:
+          logger.error(f"The subflow did not return a log ID. Aborting update for cluster {cluster_id}.")
+          supabase.table("grant_clusters").update({"status": "created"}).eq("id", cluster_id).execute()
+          raise ValueError("Required pushed_log_id was not returned by the subflow.")
+
+      logger.info(f"Updating final status for cluster {cluster_id}. Setting status to 'inserted' and storing log ID {pushed_log_id} in the 'insert_id' column.")
+
+      supabase.table("grant_clusters").update({
+          "status": "inserted",
+          "insert_id": pushed_log_id
+      }).eq("id", cluster_id).execute()
+
+      logger.info("✅ Final status updated successfully.")

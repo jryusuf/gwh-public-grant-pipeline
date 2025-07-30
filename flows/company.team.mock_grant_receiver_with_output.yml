@@ -1,0 +1,82 @@
+id: mock_grant_receiver_with_output
+namespace: company.team
+description: >
+  Acts as a mock server endpoint to receive grant data, logs it,
+  and outputs the ID of the new log record.
+
+inputs:
+  - id: grant_data_list
+    type: JSON
+    required: true
+    description: "A list containing a single grant payload formatted as a JSON string."
+
+tasks:
+  - id: log_received_grant_and_return_id
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install kestra supabase
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    containerImage: python:3.11-slim
+    script: |
+      import json
+      from kestra import Kestra
+      from supabase import create_client, Client
+
+      logger = Kestra.logger()
+      supabase_url = "{{kv('supabase_url')}}"
+      supabase_key = "{{kv('supabase_key')}}"
+      supabase: Client = create_client(supabase_url, supabase_key)
+
+      # The pusher script sends a list with a single item
+      grant_payloads = {{ inputs.grant_data_list }}
+
+      if not grant_payloads or len(grant_payloads) == 0:
+          logger.warning("Received an empty payload. Exiting without output.")
+          exit()
+
+      try:
+          grant_json_str = grant_payloads[0]
+          grant_data = json.loads(grant_json_str)
+          
+          logger.info(f"Received grant to log: {grant_data.get('grant_title')}")
+
+          log_entry = {
+              "grant_title": grant_data.get('grant_title'),
+              "grant_url": grant_data.get('url'),
+              "payload": grant_data
+          }
+
+          # Insert the record and capture the response
+          response = supabase.table("pushed_grants_log").insert(log_entry).execute()
+
+          # --- ENHANCED DEBUGGING AND ERROR HANDLING ---
+          logger.info(f"Supabase response received. Full response object: {response}")
+
+          # Check for errors first
+          if hasattr(response, 'error') and response.error:
+              logger.error(f"❌ Supabase API returned an error: {response.error.message}")
+              raise Exception(f"Supabase error: {response.error.message}")
+
+          # Check if data is present and not empty
+          if hasattr(response, 'data') and response.data:
+              new_log_id = response.data[0].get('id')
+              if new_log_id:
+                  logger.info(f"✅ Successfully logged grant. New log ID: {new_log_id}")
+                  Kestra.outputs({"pushed_log_id": new_log_id})
+              else:
+                  logger.error("❌ Response data was present, but the 'id' field was missing.")
+                  raise ValueError("Could not find 'id' in Supabase response data.")
+          else:
+              logger.error("❌ Supabase response did not contain data. Insert may have failed silently.")
+              raise ValueError("Supabase response was empty.")
+
+      except Exception as e:
+          logger.error(f"An unexpected error occurred in the mock receiver: {e}")
+          # Re-raise the exception to make sure the task fails clearly
+          raise e
+
+outputs:
+  - id: pushed_log_id
+    type: STRING
+    value: "{{outputs.log_received_grant_and_return_id.vars.pushed_log_id}}"

@@ -1,0 +1,116 @@
+id: grant_vectorizer_batch
+namespace: company.team
+
+inputs:
+  - id: grant_id_list
+    type: JSON
+    required: true
+    defaults: '[]'
+    description: A list of raw_grant IDs to process. Example `["uuid-1", "uuid-2"]`
+
+tasks:
+  - id: vectorize_and_update_batch
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install kestra supabase sentence-transformers
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    containerImage: python:3.11-slim
+    warningOnStdErr: false
+    retry:
+      type: constant
+      interval: PT30S
+      maxAttempt: 3
+    script: |
+      import json
+      from kestra import Kestra
+      from supabase import create_client, Client
+      from sentence_transformers import SentenceTransformer
+
+      logger = Kestra.logger()
+
+      # --- 1. Initialization ---
+      logger.info("Initializing Supabase client and embedding model...")
+      url = "{{kv('supabase_url')}}"
+      key = "{{kv('supabase_key')}}"
+      supabase: Client = create_client(url, key)
+      model = SentenceTransformer('all-mpnet-base-v2')
+      logger.info("✅ Supabase client and model loaded.")
+
+      # --- 2. Get and Validate Input ---
+      # The input is directly parsed by Kestra into a Python list
+      grant_ids = {{ inputs.grant_id_list }}
+
+      if not isinstance(grant_ids, list) or not grant_ids:
+          logger.info("No grant IDs provided or input is not a list. Exiting.")
+          Kestra.outputs({"processed_count": 0, "status": "SKIPPED"})
+          exit()
+
+      logger.info(f"Received {len(grant_ids)} grant(s) to process.")
+
+      processed_ids = []
+      failed_ids = []
+
+      # --- 3. Loop and Process Each Grant ---
+      for grant_id in grant_ids:
+          try:
+              logger.info(f"--- Processing Grant ID: {grant_id} ---")
+              
+              # a. Fetch Grant Data
+              logger.info("Fetching grant data...")
+              grant_response = (
+                  supabase.table("raw_grants")
+                  .select("grant_name, grant_organisation, grant_description")
+                  .eq("id", grant_id)
+                  .single()
+                  .execute()
+              )
+
+              if not grant_response.data:
+                  logger.warning(f"⚠️ Could not find a grant with ID: {grant_id}. Skipping.")
+                  failed_ids.append(grant_id)
+                  continue
+              
+              grant_data = grant_response.data
+              
+              # b. Consolidate Text for Embedding
+              text_to_embed = (
+                  f"Grant Name: {grant_data.get('grant_name', '')}. "
+                  f"Organization: {grant_data.get('grant_organisation', '')}. "
+                  f"Description: {grant_data.get('grant_description', '')}"
+              )
+              
+              # c. Generate Vector
+              logger.info("Generating vector embedding...")
+              embedding = model.encode(text_to_embed).tolist()
+
+              # d. Update the Record in Supabase
+              logger.info("Updating vector in database...")
+              update_response = (
+                  supabase.table("raw_grants")
+                  .update({"vector": embedding})
+                  .eq("id", grant_id)
+                  .execute()
+              )
+              
+              if update_response.data:
+                  logger.info(f"✅ Successfully updated vector for grant: {grant_id}")
+                  processed_ids.append(grant_id)
+              else:
+                  logger.error(f"❌ Failed to update vector for grant {grant_id}. Error: {update_response.error}")
+                  failed_ids.append(grant_id)
+
+          except Exception as e:
+              logger.error(f"❌ An unexpected error occurred while processing grant {grant_id}: {e}")
+              failed_ids.append(grant_id)
+              continue
+
+      # --- 4. Final Output ---
+      logger.info(f"🎉 Batch processing complete. Success: {len(processed_ids)}, Failed: {len(failed_ids)}.")
+      Kestra.outputs({
+          "status": "COMPLETED",
+          "processed_count": len(processed_ids),
+          "failed_count": len(failed_ids),
+          "processed_ids": processed_ids,
+          "failed_ids": failed_ids
+      })
